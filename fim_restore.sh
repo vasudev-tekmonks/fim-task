@@ -7,18 +7,26 @@
 #   1. reads writer.stat (PIDs of unauthorized writers registered by the detector)
 #      and terminates those processes after safety checks;
 #   2. when the target no longer matches the baseline (original/ + original.manifest),
-#      waits briefly for the detector's verdict, then restores the target from
-#      original/ and verifies it against the manifest.
+#      restores the target from original/ and verifies it against the manifest.
 #
 # NOTE: authorized changes are kept because the *detector* adopts them as the new
 # baseline. Run on its own, this script reverts every change.
 #
 # One-shot: meant to be called repeatedly (e.g. every 30 s) by a scheduler, AFTER
 # fim_detect.sh in each cycle; it does one pass and exits.
-# Exit status: 0 nothing to restore, 3 target restored and verified, 1 restore failed.
+# SEQUENTIAL EXECUTION IS REQUIRED: never run it concurrently with fim_detect.sh or
+# with itself. There are no lock files; a run that finds the state-dir busy exits 1
+# (enforced with flock on the state directory itself, released when the process exits).
+#
+# Exit status: 0 = success (nothing to restore, or restored and verified);
+#              1 = restore failed or error.
+#
+# So the detector can tell this script's own writes from tampering, every restore is
+# recorded in state.meta (key restorer_runs = pid:start_ms:end_ms,...). All changes to
+# the target are made by direct children of this script (cp, rm, mv, chmod, chown, mkdir,
+# find): no rsync, because its forked helpers could not be attributed from audit logs.
+#
 # Optional environment:
-#   FIM_PID_WAIT=0          seconds to wait for the detector's verdict before restoring
-#                           (only useful if the two scripts run concurrently)
 #   FIM_KILL_PARENT=1       if the writer already exited, try its parent (e.g. a loop script)
 #   FIM_KILL_INTERACTIVE=1  also terminate a writer that is an interactive shell (closes that terminal)
 #   FIM_DRY_RUN=1           log what would be killed, send no signal
@@ -28,43 +36,70 @@ RS=$'\035'
 
 usage() {
   echo "Usage: sudo $0 <file-or-dir> <state-dir> <authorized-users>" >&2
-  exit 2
+  exit 1
 }
 [[ $# -eq 3 ]] || usage
 [[ $EUID -eq 0 ]] || { echo 'Run as root.' >&2; exit 1; }
-for c in sha256sum find sort xargs cmp flock realpath mktemp getconf; do
+for c in sha256sum find sort xargs cmp flock realpath mktemp getconf diff tr cp rm mv chmod chown; do
   command -v "$c" >/dev/null 2>&1 || { echo "Missing dependency: $c" >&2; exit 1; }
 done
 
-TARGET=$(realpath -e -- "$1" 2>/dev/null) || TARGET=''
-if [[ -z $TARGET ]]; then
-  # A deleted target is a legitimate thing to restore.
-  TARGET=$(realpath -m -- "$1")
-fi
+# Resolve the directory part only: a target that is later deleted or swapped for a
+# symlink must still be found (and reported/restored), not abort the script.
+resolve_target() {
+  local d b
+  case ${1##*/} in ''|.|..) realpath -m -- "$1"; return;; esac
+  d=$(realpath -m -- "$(dirname -- "$1")"); b=$(basename -- "$1")
+  if [[ $d == / ]]; then printf '/%s\n' "$b"; else printf '%s/%s\n' "$d" "$b"; fi
+}
+TARGET=$(resolve_target "$1")
 [[ $TARGET != / ]] || { echo 'Target must not be /.' >&2; exit 1; }
-[[ ! -L $1 ]] || { echo 'Give the resolved path, not a symlink.' >&2; exit 1; }
 STATE=$(realpath -m -- "$2")
 USERS_ARG=$3
 [[ -d $STATE ]] || { echo "State dir $STATE does not exist; start fim_detect.sh first (it creates the baseline)." >&2; exit 1; }
 overlaps() { case "$1/" in "$2"/*) return 0;; esac; case "$2/" in "$1"/*) return 0;; esac; return 1; }
 if overlaps "$TARGET" "$STATE"; then echo 'Target and state-dir must not overlap.' >&2; exit 1; fi
+# The state dir drives kills and restores: it must not be writable by anyone but root.
+[[ $(stat -c %u -- "$STATE") == 0 ]] && (( (0$(stat -c %a -- "$STATE") & 022) == 0 )) \
+  || { echo "ERROR state-dir $STATE must be owned by root and not group/world-writable" >&2; exit 1; }
 
-BASELINE=$STATE/original; MANIFEST=$STATE/original.manifest; TYPE_FILE=$STATE/type
-PENDING=$STATE/writer.stat; WINDOW=$STATE/restore.window;    LOG_FILE=$STATE/restorer.log
-[[ -d $BASELINE && -f $MANIFEST && -f $TYPE_FILE ]] || { echo 'No baseline in state-dir; run fim_detect.sh first.' >&2; exit 1; }
-TYPE=$(<"$TYPE_FILE")
+BASELINE=$STATE/original; MANIFEST=$STATE/original.manifest
+META=$STATE/state.meta;   PENDING=$STATE/writer.stat
 
-PID_WAIT=${FIM_PID_WAIT:-0}
-KILL_PARENT=${FIM_KILL_PARENT:-0}; KILL_INTERACTIVE=${FIM_KILL_INTERACTIVE:-0}; DRY_RUN=${FIM_DRY_RUN:-0}
-
-log() { printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$*" | tee -a "$LOG_FILE"; }
+# Messages go to stdout; problems (ERROR/CRITICAL/UNRESOLVED/WARN) go to stderr. No log files.
+log() {
+  local line; line=$(printf '[%s] %s' "$(date --iso-8601=seconds)" "$*")
+  case $* in ERROR*|CRITICAL*|UNRESOLVED*|WARN*) printf '%s\n' "$line" >&2;; *) printf '%s\n' "$line";; esac
+}
 now_ms() { date +%s%3N; }
 
-exec {LFD}>"$STATE/state.lock"
-lock()   { flock -x "$LFD"; }
-unlock() { flock -u "$LFD"; }
-exec {ILFD}>"$STATE/restorer.lock"
-flock -n "$ILFD" || { echo 'Previous restorer run still active; skipping.' >&2; exit 0; }
+# Enforce strictly sequential execution without a lock file: flock the state directory.
+exec {SLFD}<"$STATE" && flock -n "$SLFD" || { echo 'ERROR state-dir is busy: fim_detect.sh and fim_restore.sh must run strictly one after another' >&2; exit 1; }
+
+# ---------------------------------------------------------------- state.meta (key=value)
+meta_get() {   # prints the value of key $1; fails if absent
+  local line; [[ -r $META ]] || return 1
+  while IFS= read -r line; do
+    [[ $line == "$1="* ]] && { printf '%s' "${line#*=}"; return 0; }
+  done <"$META"
+  return 1
+}
+meta_set() {   # key value: keep every other line, replace/add this one, swap in with an atomic mv
+  local k=$1 v=$2 tmp line found=0
+  tmp=$(mktemp "$STATE/state.meta.XXXXXX") || return 1
+  if [[ -r $META ]]; then
+    while IFS= read -r line; do
+      if [[ $line == "$k="* ]]; then printf '%s=%s\n' "$k" "$v"; found=1; else printf '%s\n' "$line"; fi
+    done <"$META" >"$tmp"
+  fi
+  (( found )) || printf '%s=%s\n' "$k" "$v" >>"$tmp"
+  mv -f -- "$tmp" "$META"
+}
+
+TYPE=$(meta_get type) || TYPE=''
+[[ -d $BASELINE && -f $MANIFEST && ( $TYPE == file || $TYPE == directory ) ]] || { echo 'No baseline in state-dir; run fim_detect.sh first.' >&2; exit 1; }
+MTGT=$(meta_get target) || MTGT=''
+[[ -z $MTGT || $MTGT == "$TARGET" ]] || { echo "ERROR state-dir belongs to $MTGT, not $TARGET." >&2; exit 1; }
 
 # ---------------------------------------------------------------- manifest (same format as the detector's)
 manifest() {
@@ -81,6 +116,41 @@ manifest() {
   fi
 }
 integrity_ok() { manifest "$TARGET" 2>/dev/null | cmp -s -- "$MANIFEST" -; }
+
+# ---------------------------------------------------------------- run record (read by fim_detect.sh)
+RUN_OPEN=0
+begin_run() {   # record pid:start:0 BEFORE the first modification; close runs a crash left open
+  local v now r new='' n=0; local -a a=() keep=()
+  now=$(now_ms); v=$(meta_get restorer_runs) || v=''
+  IFS=, read -ra a <<<"$v"
+  for r in ${a[@]+"${a[@]}"}; do
+    [[ $r =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || continue
+    [[ $r == *:0 ]] && r="${r%:0}:$now"
+    keep+=("$r")
+  done
+  keep+=("$$:$((now - 2000)):0")
+  (( ${#keep[@]} > 20 )) && keep=("${keep[@]: -20}")
+  for r in "${keep[@]}"; do new+="${new:+,}$r"; done
+  meta_set restorer_runs "$new" && RUN_OPEN=1
+}
+end_run() {     # close this run (EXIT trap)
+  (( RUN_OPEN )) || return 0
+  RUN_OPEN=0
+  local v now r new='' n; local -a a=()
+  now=$(now_ms); v=$(meta_get restorer_runs) || return 0
+  IFS=, read -ra a <<<"$v"
+  for r in ${a[@]+"${a[@]}"}; do
+    [[ $r == "$$":*:0 ]] && r="${r%:0}:$now"
+    new+="${new:+,}$r"
+  done
+  meta_set restorer_runs "$new"
+}
+# Every run ends with one summary line on stdout:  RESULT exit=<code> status=<text>
+STATUS='ERROR - see the messages above'
+KILLED=0
+on_exit() { local rc=$?; end_run; log "RESULT exit=$rc status=$STATUS"; }
+trap on_exit EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM
 
 # ---------------------------------------------------------------- authorization (double check of the detector's verdict)
 declare -A AUTH=()
@@ -176,63 +246,103 @@ respond() {   # pid expected_exe event_ts_ms role  -> sets R (killed|gone|refuse
   if [[ $DRY_RUN == 1 ]]; then log "PID_DRY_RUN $tag"; return; fi
   terminate "$pid" "$start" "${seq[@]}"
 }
+KILL_PARENT=${FIM_KILL_PARENT:-0}; KILL_INTERACTIVE=${FIM_KILL_INTERACTIVE:-0}; DRY_RUN=${FIM_DRY_RUN:-0}
 
 process_pending() {
   local recs='' ts pid ppid uid user exe comm path
-  lock
   if [[ -s $PENDING ]]; then recs=$(<"$PENDING"); : >"$PENDING"; fi
-  unlock
   [[ -n $recs ]] || return 0
   load_authorized
   while IFS=$RS read -r ts pid ppid uid user exe comm path; do
     [[ $pid =~ ^[0-9]+$ && $ts =~ ^[0-9]+$ ]] || continue
-    if [[ -n ${AUTH[$uid]:-} ]]; then log "SKIP pid=$pid user=$user is authorized here"; continue; fi
+    if [[ $uid =~ ^[0-9]+$ && -n ${AUTH[$uid]:-} ]]; then log "SKIP pid=$pid user=$user is authorized here"; continue; fi
     log "KILL_REQUEST pid=$pid user=$user exe=$exe path=$path"
     respond "$pid" "$exe" "$ts" writer
+    [[ $R == killed ]] && KILLED=$((KILLED+1))
     if [[ $R == gone && $KILL_PARENT == 1 && $ppid =~ ^[0-9]+$ ]] && (( ppid > 1 )); then
       respond "$ppid" '' "$ts" parent
+      [[ $R == killed ]] && KILLED=$((KILLED+1))
     fi
   done <<<"$recs"
 }
 
 # ---------------------------------------------------------------- restore
-copy_tree() { if command -v rsync >/dev/null 2>&1; then rsync -aHAX --numeric-ids --delete -- "$1/" "$2/"; else
-                find "$2" -mindepth 1 -delete; cp -a -- "$1/." "$2/"; fi; }
+# Every command below that touches the target is run directly by this script (no pipes
+# into writers, no rsync, no command substitution around a writer), so the audit log
+# shows it as a child of this PID.
+restore_dir_full() {   # fallback: empty the target and copy everything back
+  find "$TARGET" -mindepth 1 -delete &&
+  cp -aT -- "$BASELINE" "$TARGET" &&
+  chown --reference="$BASELINE" -- "$TARGET" && chmod --reference="$BASELINE" -- "$TARGET"
+}
+restore_dir() {   # incremental: remove extras, re-copy only what differs from the manifest
+  local p rel b src dst cur line
+  local -A CH=()
+  # 1. delete anything the baseline does not have, or has as a different kind of object
+  while IFS= read -r -d '' p; do
+    rel=${p#"$TARGET"/}; b=$BASELINE/$rel
+    if [[ ! -e $b && ! -L $b ]]; then rm -rf -- "$p"
+    elif { [[ -L $p ]] && [[ ! -L $b ]]; } || { [[ ! -L $p ]] && [[ -L $b ]]; } \
+         || { [[ -d $p && ! -L $p ]] && ! [[ -d $b && ! -L $b ]]; } \
+         || { ! [[ -d $p && ! -L $p ]] && [[ -d $b && ! -L $b ]]; }; then rm -rf -- "$p"
+    fi
+  done < <(find "$TARGET" -depth -mindepth 1 -print0)
+  # 2. paths whose manifest records differ
+  cur=$(mktemp "$STATE/.restore.XXXXXX") || return 1
+  manifest "$TARGET" >"$cur" 2>/dev/null
+  while IFS= read -r line; do
+    if [[ $line =~ ^[0-9a-f]{64}\ \ \./(.*)$ ]]; then rel=${BASH_REMATCH[1]}
+    else line=${line#*$'\t'}; line=${line#*$'\t'}; line=${line#*$'\t'}; line=${line#*$'\t'}; rel=${line%%$'\t'*}; fi
+    CH["/$rel"]=1       # leading '/' so the root directory (empty rel) is a valid key
+  done < <(diff --old-line-format='%L' --new-line-format='%L' --unchanged-line-format='' \
+                <(tr '\0' '\n' <"$MANIFEST") <(tr '\0' '\n' <"$cur"))
+  rm -f -- "$cur"
+  # 3. copy them back, parents before children
+  while IFS= read -r -d '' rel; do
+    rel=${rel#/}
+    if [[ -z $rel ]]; then chown --reference="$BASELINE" -- "$TARGET"; chmod --reference="$BASELINE" -- "$TARGET"; continue; fi
+    src=$BASELINE/$rel; dst=$TARGET/$rel
+    [[ -e $src || -L $src ]] || continue
+    if [[ -d $src && ! -L $src ]]; then
+      if [[ -d $dst && ! -L $dst ]]; then chown --reference="$src" -- "$dst"; chmod --reference="$src" -- "$dst"
+      else rm -rf -- "$dst"; cp -aT -- "$src" "$dst" || return 1; fi
+    else
+      cp -aT --remove-destination -- "$src" "$dst" || return 1
+    fi
+  done < <(printf '%s\0' "${!CH[@]}" | LC_ALL=C sort -z)
+  return 0
+}
 restore() {
   local rc=0 tmp parent
-  lock
-  printf '%s %s\n' "$(now_ms)" "$(( $(now_ms) + 60000 ))" >"$WINDOW"   # tell the detector to ignore our own writes
+  begin_run || log 'WARN could not record this run in state.meta; the detector may report these writes'
   if [[ $TYPE == file ]]; then
     parent=$(dirname -- "$TARGET"); mkdir -p -- "$parent"
     [[ -d $TARGET && ! -L $TARGET ]] && rm -rf -- "$TARGET"
-    tmp=$(mktemp "$parent/.fim-restore.XXXXXX") && cp -a -- "$BASELINE/item" "$tmp" && mv -fT -- "$tmp" "$TARGET" || rc=1
+    tmp=$(mktemp -u "$parent/.fim-restore.XXXXXX")
+    cp -a -- "$BASELINE/item" "$tmp" && mv -fT -- "$tmp" "$TARGET" || { rm -f -- "$tmp"; rc=1; }
   else
     [[ -d $TARGET && ! -L $TARGET ]] || rm -rf -- "$TARGET"
-    mkdir -p -- "$TARGET" && copy_tree "$BASELINE" "$TARGET" || rc=1
+    mkdir -p -- "$TARGET" || rc=1
+    if (( rc == 0 )); then
+      restore_dir || rc=1
+      if (( rc )) || ! integrity_ok; then
+        log 'WARN incremental restore did not verify; doing a full restore'
+        restore_dir_full || rc=1
+      fi
+    fi
   fi
   if (( rc == 0 )) && integrity_ok; then log "RESTORE_VERIFIED target=$TARGET"
   else log "CRITICAL restore failed or did not verify; manual intervention required target=$TARGET"; rc=1; fi
-  printf '%s %s\n' "$(now_ms)" "$(now_ms)" >"$WINDOW"
-  unlock
   return $rc
 }
 
-# One pass. Exit status: 0 = nothing to restore, 3 = target restored and verified,
-# 1 = restore failed.
+# One pass. Returns 0 = success (nothing to restore, or restored and verified), 1 = failed.
 run_once() {
   [[ -s $PENDING ]] && process_pending          # kill registered writers first
-  integrity_ok && return 0
+  if integrity_ok; then STATUS="OK - target intact, nothing to restore (processes killed: $KILLED)"; return 0; fi
   log 'ALERT integrity mismatch'
-  # Optional grace period, only useful when the detector runs concurrently.
-  local sig0 i; sig0=$(stat -c '%i-%y' -- "$MANIFEST" 2>/dev/null)
-  for ((i=0; i<PID_WAIT*10; i++)); do
-    [[ -s $PENDING ]] && break
-    [[ $(stat -c '%i-%y' -- "$MANIFEST" 2>/dev/null) != "$sig0" ]] && break
-    sleep 0.1
-  done
-  process_pending
-  if integrity_ok; then log 'INFO change no longer present (adopted as authorized, or reverted)'; return 0; fi
-  restore && return 3
+  if restore; then STATUS="OK - target restored from baseline and verified (processes killed: $KILLED)"; return 0; fi
+  STATUS="FAILED - restore did not verify; manual intervention required (processes killed: $KILLED)"
   return 1
 }
 
